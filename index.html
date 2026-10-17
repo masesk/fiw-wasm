@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Locked page</title>
+<style>
+  :root {
+    --bg: #e6ebee; --ink: #1b2a33; --muted: #55676f;
+    --field: #ffffff; --line: #9fb0b8; --accent: #0f6e6a; --error: #a3341f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16232b; --ink: #e8eef0; --muted: #9db0b8;
+      --field: #0f1a20; --line: #46606b; --accent: #5cc4bd; --error: #ff9c85;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: grid; place-items: center; padding: 1.5rem;
+    background: var(--bg); color: var(--ink);
+    font: 1rem/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { width: 100%; max-width: 26rem; }
+  h1 {
+    margin: 0 0 .5rem; font-weight: 600; font-size: 2rem; line-height: 1.15;
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    letter-spacing: -0.01em;
+  }
+  .lede { margin: 0 0 2rem; color: var(--muted); }
+  label { display: block; margin: 1.25rem 0 .375rem; font-size: .875rem; font-weight: 600; }
+  label:first-child { margin-top: 0; }
+  .row { display: flex; gap: .5rem; }
+  input, button { font: inherit; border-radius: 6px; padding: .625rem .75rem; }
+  input {
+    flex: 1; min-width: 0; width: 100%; color: var(--ink);
+    background: var(--field); border: 1px solid var(--line);
+  }
+  input.code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .875rem; }
+  button {
+    border: 1px solid var(--accent); background: var(--accent);
+    color: var(--bg); font-weight: 600; cursor: pointer; white-space: nowrap;
+  }
+  button.quiet { background: transparent; color: var(--accent); }
+  button.wide { width: 100%; margin-top: 1.5rem; }
+  button:disabled { opacity: .6; cursor: progress; }
+  input:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .msg { min-height: 1.5rem; margin: .75rem 0 0; color: var(--error); font-size: .9375rem; }
+  .msg.info { color: var(--muted); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <!-- Visitors see this -->
+  <section id="gate">
+    <h1>This page is locked</h1>
+    <p class="lede">Enter your access code to open it.</p>
+    <form id="unlockForm">
+      <label for="code">Access code</label>
+      <div class="row">
+        <input id="code" type="password" autocomplete="current-password" required>
+        <button id="unlock">Unlock</button>
+      </div>
+      <p id="gateMsg" class="msg" role="alert"></p>
+    </form>
+  </section>
+
+  <!-- You see this at index.html?setup -->
+  <section id="setup" hidden>
+    <h1>Encrypt a site</h1>
+    <p class="lede">Nothing is uploaded. The folder is encrypted in this browser and saved to your device as one file.</p>
+    <form id="encryptForm">
+      <label for="folder">Folder to protect (with index.html at its top level)</label>
+      <input id="folder" type="file" webkitdirectory required>
+      <label for="newCode">Access code</label>
+      <div class="row">
+        <input id="newCode" class="code" type="text" autocomplete="off" spellcheck="false" required>
+        <button id="generate" class="quiet" type="button">Generate</button>
+      </div>
+      <button id="encrypt" class="wide">Encrypt and save</button>
+      <p id="setupMsg" class="msg" role="alert"></p>
+    </form>
+  </section>
+</main>
+
+<script>
+  const PAYLOAD = 'site.enc';      // encrypted folder, stored next to this page
+  const ENTRY = 'index.html';      // the folder's page that opens after unlocking
+  const ITERATIONS = 250000;       // PBKDF2 rounds; must match between encrypt and unlock
+
+  /* crypto:start */
+  // site.enc layout: a header, then chunks of the encrypted archive.
+  //   header: "LCK1" | 16-byte salt | chunk size (uint32) | site.enc size (float64)
+  //   chunk:  12-byte IV | AES-256-GCM ciphertext of up to `chunk size` bytes
+  // Each chunk is authenticated with its index and whether it is the last one, so chunks can't be
+  // reordered, swapped or cut off. The plaintext is the gzipped archive:
+  //   manifest length (uint32) | manifest JSON [{path, size, type}] | each file's bytes, in manifest order
+  const MAGIC = [0x4c, 0x43, 0x4b, 0x31];
+  const HEADER = 32;
+  const CHUNK = 4 << 20;
+  const TYPES = {
+    html: 'text/html', htm: 'text/html', js: 'text/javascript', mjs: 'text/javascript', css: 'text/css',
+    json: 'application/json', wasm: 'application/wasm', txt: 'text/plain', svg: 'image/svg+xml',
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon',
+    mp3: 'audio/mpeg', ogg: 'audio/ogg', wav: 'audio/wav', mp4: 'video/mp4', webm: 'video/webm',
+  };
+
+  function typeFor(path) {
+    return TYPES[path.split('.').pop().toLowerCase()] || 'application/octet-stream';
+  }
+
+  async function deriveKey(code, salt) {
+    const material = await crypto.subtle.importKey(
+      'raw', new TextEncoder().encode(code), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt, iterations: ITERATIONS, hash: 'SHA-512' },
+      material, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  }
+
+  function chunkData(index, last) {
+    const data = new Uint8Array(5);
+    new DataView(data.buffer).setUint32(0, index);
+    data[4] = last ? 1 : 0;
+    return data;
+  }
+
+  async function sealChunk(key, plain, index, last) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const cipher = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: chunkData(index, last) }, key, plain);
+    return new Blob([iv, cipher]);
+  }
+
+  // entries: [{path, file}], where file is a File or Blob. Resolves to the Blob to save as site.enc.
+  async function encryptArchive(entries, code, onProgress) {
+    const manifest = new TextEncoder().encode(JSON.stringify(
+      entries.map(({ path, file }) => ({ path, size: file.size, type: typeFor(path) }))));
+    const head = new Uint8Array(4 + manifest.length);
+    new DataView(head.buffer).setUint32(0, manifest.length);
+    head.set(manifest, 4);
+    const archive = new Blob([head, ...entries.map(entry => entry.file)]);
+
+    let done = 0;
+    const reader = archive.stream()
+      .pipeThrough(new TransformStream({
+        transform(bytes, out) { done += bytes.length; onProgress(done / archive.size); out.enqueue(bytes); },
+      }))
+      .pipeThrough(new CompressionStream('gzip'))
+      .getReader();
+
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const key = await deriveKey(code, salt);
+    const chunks = [];
+    let buffer = new Uint8Array(CHUNK), fill = 0;
+    for (;;) {
+      const { done: finished, value } = await reader.read();
+      if (finished) break;
+      for (let at = 0; at < value.length;) {
+        if (fill === CHUNK) {
+          // More bytes follow, so this full chunk isn't the last one.
+          chunks.push(await sealChunk(key, buffer, chunks.length, false));
+          buffer = new Uint8Array(CHUNK); fill = 0;
+        }
+        const take = Math.min(CHUNK - fill, value.length - at);
+        buffer.set(value.subarray(at, at + take), fill);
+        fill += take; at += take;
+      }
+    }
+    chunks.push(await sealChunk(key, buffer.subarray(0, fill), chunks.length, true));
+
+    const header = new Uint8Array(HEADER);
+    const view = new DataView(header.buffer);
+    header.set(MAGIC); header.set(salt, 4);
+    view.setUint32(20, CHUNK);
+    view.setFloat64(24, HEADER + chunks.reduce((sum, chunk) => sum + chunk.size, 0));
+    return new Blob([header, ...chunks], { type: 'application/octet-stream' });
+  }
+
+  // Reads a byte stream in pieces of a chosen size, however the network splits it up.
+  function byteReader(stream, onBytes) {
+    const reader = stream.getReader();
+    const pieces = [];
+    let held = 0, ended = false;
+
+    async function fillTo(n) {
+      while (held < n && !ended) {
+        const { done, value } = await reader.read();
+        if (done) { ended = true; break; }
+        pieces.push(value); held += value.length; onBytes(value.length);
+      }
+    }
+
+    return {
+      // Up to n bytes; fewer only at the end of the stream.
+      async read(n) {
+        await fillTo(n);
+        const out = new Uint8Array(Math.min(n, held));
+        for (let at = 0; at < out.length;) {
+          const piece = pieces[0], take = Math.min(piece.length, out.length - at);
+          out.set(piece.subarray(0, take), at);
+          at += take;
+          if (take === piece.length) pieces.shift(); else pieces[0] = piece.subarray(take);
+        }
+        held -= out.length;
+        return out;
+      },
+      async atEnd() { await fillTo(1); return held === 0; },
+      cancel() { reader.cancel().catch(() => {}); },
+    };
+  }
+
+  // Resolves to {path: Blob}. Rejects with Error('wrong-code') if the code doesn't match the first
+  // chunk, Error('damaged') if site.enc isn't intact, or a network error if the download fails.
+  async function decryptArchive(stream, code, onProgress) {
+    let received = 0, size = Infinity;
+    const input = byteReader(stream, bytes => { received += bytes; onProgress(Math.min(received / size, 1)); });
+    try {
+      const header = await input.read(HEADER);
+      if (header.length < HEADER || MAGIC.some((byte, i) => header[i] !== byte)) throw new Error('damaged');
+      const view = new DataView(header.buffer);
+      const chunkSize = view.getUint32(20);
+      size = view.getFloat64(24);
+      const key = await deriveKey(code, header.slice(4, 20));
+
+      const gunzip = new DecompressionStream('gzip');
+      const writer = gunzip.writable.getWriter();
+      const archive = new Response(gunzip.readable).blob();
+      archive.catch(() => {}); // failures surface through the loop below
+      try {
+        for (let index = 0, last = false; !last; index++) {
+          const sealed = await input.read(12 + chunkSize + 16);
+          last = await input.atEnd();
+          if (sealed.length < 12 + 16) throw new Error('damaged');
+          let plain;
+          try {
+            plain = await crypto.subtle.decrypt(
+              { name: 'AES-GCM', iv: sealed.subarray(0, 12), additionalData: chunkData(index, last) },
+              key, sealed.subarray(12));
+          } catch (err) {
+            throw new Error(index === 0 ? 'wrong-code' : 'damaged');
+          }
+          await writer.write(new Uint8Array(plain));
+        }
+        await writer.close();
+      } catch (err) {
+        writer.abort(err).catch(() => {});
+        throw err;
+      }
+      return unpack(await archive);
+    } finally {
+      input.cancel();
+    }
+  }
+
+  async function unpack(archive) {
+    const length = new DataView(await archive.slice(0, 4).arrayBuffer()).getUint32(0);
+    const manifest = JSON.parse(await archive.slice(4, 4 + length).text());
+    const files = {};
+    let offset = 4 + length;
+    for (const { path, size, type } of manifest) {
+      files[path] = archive.slice(offset, offset + size, type);
+      offset += size;
+    }
+    return files;
+  }
+
+  function randomCode(length) {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'; // 64 chars
+    return Array.from(crypto.getRandomValues(new Uint8Array(length)), b => alphabet[b & 63]).join('');
+  }
+  /* crypto:end */
+
+  const $ = (id) => document.getElementById(id);
+  const supported = !!(window.crypto && crypto.subtle && window.CompressionStream && window.DecompressionStream);
+  const NEEDS_HTTPS = window.isSecureContext
+    ? 'This browser is too old to open this page. Update it and try again.'
+    : 'This page only works over HTTPS or on localhost.';
+
+  function say(el, text, kind) { el.className = 'msg ' + (kind || ''); el.textContent = text; }
+  const percent = (fraction) => Math.round(100 * fraction) + '%';
+  const megabytes = (bytes) => (bytes / 1048576).toFixed(1) + ' MB';
+
+  // Points the entry page's quoted references to the other files ("Build/Web.wasm", './style.css')
+  // at their decrypted copies. References inside other files, such as CSS url(), are left as they are.
+  function linkFiles(html, files) {
+    for (const [path, blob] of Object.entries(files)) {
+      if (path === ENTRY) continue;
+      const url = URL.createObjectURL(blob);
+      for (const quote of ['"', "'"]) {
+        for (const ref of [path, './' + path]) html = html.split(quote + ref + quote).join(quote + url + quote);
+      }
+    }
+    return html;
+  }
+
+  // The picked folder's files, with paths relative to it. Skips hidden files and folders, and
+  // Unity's *_DoNotShip debug folders.
+  function siteFiles(list) {
+    return Array.from(list, file => ({ file, path: file.webkitRelativePath.split('/').slice(1).join('/') }))
+      .filter(({ path }) => !path.split('/').some(part => part.startsWith('.') || part.endsWith('_DoNotShip')));
+  }
+
+  if (new URLSearchParams(location.search).has('setup')) {
+    $('gate').hidden = true;
+    $('setup').hidden = false;
+    document.title = 'Encrypt a site';
+  } else {
+    $('code').focus();
+  }
+
+  $('unlockForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!supported) return say($('gateMsg'), NEEDS_HTTPS);
+    $('unlock').disabled = true;
+    say($('gateMsg'), 'Unlocking…', 'info');
+
+    let files;
+    try {
+      const res = await fetch(PAYLOAD, { cache: 'no-cache' });
+      if (!res.ok || !res.body) throw new Error('missing');
+      files = await decryptArchive(res.body, $('code').value.trim(),
+        fraction => say($('gateMsg'), 'Unlocking… ' + percent(fraction), 'info'));
+      if (!files[ENTRY]) throw new Error('damaged');
+    } catch (err) {
+      $('unlock').disabled = false;
+      if (err.message === 'wrong-code') {
+        say($('gateMsg'), "That code doesn't match. Check it and try again.");
+        $('code').select();
+      } else if (err.message === 'damaged') {
+        say($('gateMsg'), 'The protected files are damaged or incomplete. Ask the owner to publish them again.');
+      } else {
+        say($('gateMsg'), 'The protected page could not be loaded. Check your connection and try again.');
+      }
+      return;
+    }
+
+    const html = linkFiles(await files[ENTRY].text(), files);
+    document.open(); document.write(html); document.close();
+  });
+
+  $('generate').addEventListener('click', () => {
+    if (!supported) return say($('setupMsg'), NEEDS_HTTPS);
+    $('newCode').value = randomCode(32);
+    say($('setupMsg'), 'Copy this code somewhere safe before you continue. It cannot be recovered.', 'info');
+  });
+
+  $('encryptForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!supported) return say($('setupMsg'), NEEDS_HTTPS);
+    const code = $('newCode').value.trim();
+    if (code.length < 20) return say($('setupMsg'), 'Use at least 20 characters, or press Generate.');
+    const entries = siteFiles($('folder').files);
+    if (!entries.some(entry => entry.path === ENTRY)) {
+      return say($('setupMsg'), 'That folder has no ' + ENTRY + ' at its top level. Pick the folder that contains it.');
+    }
+    $('encrypt').disabled = true;
+
+    try {
+      const sealed = await encryptArchive(entries, code,
+        fraction => say($('setupMsg'), 'Encrypting ' + entries.length + ' files… ' + percent(fraction), 'info'));
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(sealed);
+      link.download = PAYLOAD;
+      document.body.appendChild(link); link.click(); link.remove();
+      say($('setupMsg'), 'Saved ' + PAYLOAD + ' (' + megabytes(sealed.size) + '). Publish it next to this page. ' +
+        "Don't publish the original folder.", 'info');
+    } catch (err) {
+      say($('setupMsg'), 'The folder could not be encrypted. Pick it again and retry.');
+    } finally {
+      $('encrypt').disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
